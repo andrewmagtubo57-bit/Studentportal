@@ -37,48 +37,68 @@ Storage: `profiles/{uid}/avatar`
 Student registers, verifies email, admin approves under Students > Approve, then the student can sign in.
 
 
-===== FIRESTORE RULES (paste in Firestore > Rules) =====
+===== FIRESTORE RULES (Firestore Database > Rules; paste ONLY this section) =====
 rules_version = '2';
 service cloud.firestore {
-  match /databases/{db}/documents {
+  match /databases/{database}/documents {
     function signedIn() { return request.auth != null; }
     function isAdmin() {
-      return signedIn() &&
-        get(/databases/$(db)/documents/users/$(request.auth.uid)).data.role == 'admin';
+      return signedIn() && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
     }
+    function mark(n) { return n is number && n >= 0 && n <= 100; }
 
     match /users/{uid} {
-      // Admins list everyone; students read only themselves
       allow read: if isAdmin() || (signedIn() && request.auth.uid == uid);
-      // Self-registration: always a pending student, never an admin
       allow create: if signedIn() && request.auth.uid == uid
-        && request.resource.data.role == 'student'
-        && request.resource.data.status == 'pending';
-      // Students may edit only these profile fields
+        && request.resource.data.role == 'student' && request.resource.data.status == 'pending';
       allow update: if isAdmin() || (signedIn() && request.auth.uid == uid
         && request.resource.data.diff(resource.data).affectedKeys()
-           .hasOnly(['firstName','middleName','lastName','birthday','gender','photoURL']));
+             .hasOnly(['firstName','middleName','lastName','birthday','gender','photoURL']));
       allow delete: if isAdmin();
     }
-
     match /grades/{id} {
+      allow read: if isAdmin() || (signedIn() && resource.data.studentId == request.auth.uid);
+      allow create, update: if isAdmin() && mark(request.resource.data.prelim)
+        && mark(request.resource.data.midterm) && mark(request.resource.data.final);
+      allow delete: if isAdmin();
+    }
+    match /attendance/{id} {
       allow read: if isAdmin() || (signedIn() && resource.data.studentId == request.auth.uid);
       allow write: if isAdmin();
     }
-    match /subjects/{id}      { allow read: if signedIn(); allow write: if isAdmin(); }
-    match /announcements/{id} { allow read: if signedIn(); allow write: if isAdmin(); }
+    match /submissions/{id} {
+      allow read: if isAdmin() || (signedIn() && resource.data.studentId == request.auth.uid);
+      allow create: if signedIn() && request.resource.data.studentId == request.auth.uid
+        && !('score' in request.resource.data);
+      allow update: if isAdmin() || (signedIn() && resource.data.studentId == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['fileURL','fileName','late','submittedAt']));
+      allow delete: if isAdmin();
+    }
+    match /notifications/{id} {
+      allow read: if isAdmin() || (signedIn() && (resource.data.userId == 'all' || resource.data.userId == request.auth.uid));
+      allow write: if isAdmin();
+    }
+    match /{col}/{id} {
+      allow read: if signedIn() && col in ['subjects','announcements','assignments'];
+      allow write: if isAdmin() && col in ['subjects','announcements','assignments'];
+    }
   }
 }
 
-===== STORAGE RULES (paste in Storage > Rules) =====
+===== STORAGE RULES (Storage > Rules; paste ONLY this section) =====
 rules_version = '2';
 service firebase.storage {
   match /b/{bucket}/o {
     match /profiles/{uid}/{file} {
       allow read: if request.auth != null;
       allow write: if request.auth != null && request.auth.uid == uid
-        && request.resource.size < 2 * 1024 * 1024
-        && request.resource.contentType.matches('image/.*');
+        && request.resource.size < 2 * 1024 * 1024 && request.resource.contentType.matches('image/.*');
+    }
+    match /submissions/{uid}/{file} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && request.auth.uid == uid
+        && request.resource.size < 10 * 1024 * 1024;
     }
   }
 }
@@ -138,6 +158,7 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:10px 8px
 @media(max-width:820px){#auth{grid-template-columns:1fr}.hero{display:none}
 #app{grid-template-columns:1fr}aside{position:fixed;left:0;width:240px;transform:translateX(-100%)}aside.open{transform:none}#burger{display:inline-block}.grid2{grid-template-columns:1fr}}
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
+@media print{aside,.top button,.row{display:none!important}#app{display:block}}
 </style>
 </head>
 <body>
@@ -231,7 +252,7 @@ onAuthStateChanged(auth,async u=>{
   if(me.role==="student"&&!u.emailVerified){await signOut(auth);return say("Verify your email first. Check your inbox.")}
   if(me.role==="student"&&me.status!=="active"){await signOut(auth);return say("Your registration is awaiting admin approval.")}
   $("#auth").classList.add("hide");$("#app").classList.remove("hide");$("#who").textContent=fullName(me)+" ("+me.role+")";
-  const items=me.role==="admin"?["dashboard","students","subjects","grades","announcements"]:["dashboard","grades","subjects","announcements","profile"];
+  const items=me.role==="admin"?["dashboard","students","subjects","grades","attendance","assignments","announcements"]:["dashboard","grades","attendance","assignments","subjects","announcements","notifications","profile"];
   $("#nav").innerHTML=items.map(i=>`<button class="nav" data-p="${i}">${i[0].toUpperCase()+i.slice(1)}</button>`).join("");
   $("#nav").querySelectorAll(".nav").forEach(b=>b.onclick=()=>go(b.dataset.p));go("dashboard");
 });
@@ -280,6 +301,15 @@ P.admin_dashboard=async()=>{const [u,s,g]=await Promise.all([list("users"),list(
   const by={};st_.forEach(x=>by[x.course]=(by[x.course]||0)+1);const pass=g.filter(x=>avg(x)>=75).length;
   $("#view").innerHTML=`<div class="cards">${stat(st_.length,"Students")}${stat(st_.filter(x=>x.status==="active").length,"Enrolled")}${stat(st_.filter(x=>x.status==="pending").length,"Pending registrations")}${stat(s.length,"Subjects")}</div>
   <div class="cards" style="grid-template-columns:repeat(auto-fit,minmax(280px,1fr))"><div class="card"><h3>Students per course</h3><canvas id="c1"></canvas></div><div class="card"><h3>Passed vs failed grades</h3><canvas id="c2"></canvas></div></div>`;
+  $("#view").insertAdjacentHTML("beforeend",`<div class="card" style="margin-top:14px"><h3>Example data</h3><p style="color:var(--mute)">Adds 5 sample subjects, 3 announcements, and sample grades for every approved student.</p><button class="btn" id="seed">Load example data</button></div>`);
+  $("#seed").onclick=async()=>{if(!confirm("Add example subjects, announcements and grades?"))return;try{
+    const subs=[["MATH101","College Algebra","Prof. Ana Reyes","Room 201","Mon/Wed 8:00-9:30",3],["ENG102","Communication Skills","Prof. Ben Cruz","Room 105","Tue/Thu 10:00-11:30",3],["CS110","Intro to Programming","Prof. Carla Lim","Lab 3","Mon/Wed 1:00-2:30",4],["SCI120","General Physics","Prof. David Tan","Room 310","Tue/Thu 1:00-2:30",3],["PE101","Physical Education","Coach Elena Diaz","Gym","Fri 9:00-11:00",2]];
+    const refs=[];for(const [code,name,instructor,room,schedule,units] of subs){const d={code,name,instructor,room,schedule,units};refs.push({id:(await addDoc(collection(db,"subjects"),d)).id,...d})}
+    const ann=[["Welcome to the new term","Classes begin Monday. Please check your schedule under Subjects."],["Midterm examinations","Midterms run next month. Room assignments will be posted a week before."],["Enrollment reminder","Enrollment for next term opens soon. Settle any pending requirements at the registrar."]];
+    for(const [title,body] of ann)await addDoc(collection(db,"announcements"),{title,body,author:fullName(me),createdAt:serverTimestamp()});
+    const marks=[[88,90,92],[82,85,80],[95,93,97],[72,70,68],[90,91,94]];
+    for(const stu of st_.filter(x=>x.status==="active"))for(let i=0;i<refs.length;i++){const r=refs[i],m=marks[i];await addDoc(collection(db,"grades"),{studentId:stu.id,subjectId:r.id,subjectCode:r.code,subjectName:r.name,instructor:r.instructor,prelim:m[0],midterm:m[1],final:m[2]})}
+    toast("Example data added");go("dashboard")}catch(e){toast("Failed: "+e.message)}};
   chart("#c1","bar",Object.keys(by),Object.values(by),"Students");chart("#c2","doughnut",["Passed","Failed"],[pass,g.length-pass],"")};
 P.admin_students=async()=>{const all=(await list("users")).filter(x=>x.role==="student");
   $("#view").innerHTML=`<div class="row"><input id="q" placeholder="Search name or ID"><select id="fs"><option value="">All statuses</option><option>pending</option><option>active</option></select></div><div class="card wrap" id="tb"></div>`;
@@ -295,17 +325,64 @@ P.admin_subjects=async()=>{const s=await list("subjects");$("#view").innerHTML=`
   $("#view").querySelectorAll("[data-e]").forEach(b=>b.onclick=()=>{const x=s.find(y=>y.id===b.dataset.e);form("Edit subject",F(x),d=>updateDoc(doc(db,"subjects",x.id),d))});
   $("#view").querySelectorAll("[data-d]").forEach(b=>b.onclick=async()=>{if(confirm("Delete this subject?")){await deleteDoc(doc(db,"subjects",b.dataset.d));go("subjects")}})};
 P.admin_grades=async()=>{const [g,s,u]=await Promise.all([list("grades"),list("subjects"),list("users")]);const stu=u.filter(x=>x.role==="student"&&x.status==="active"),nm=id=>fullName(u.find(x=>x.id===id)||{});
-  $("#view").innerHTML=`<div class="row"><button class="btn" id="add">Encode grade</button></div><div class="card wrap"><table><tr><th>Student</th><th>Subject</th><th>Prelim</th><th>Midterm</th><th>Final</th><th>Avg</th><th></th></tr>${g.map(x=>`<tr><td>${esc(nm(x.studentId))}</td><td>${esc(x.subjectCode)}</td><td>${esc(x.prelim)}</td><td>${esc(x.midterm)}</td><td>${esc(x.final)}</td><td>${avg(x)}</td><td><button class="btn sm ghost" data-e="${x.id}">Edit</button> <button class="btn sm red" data-d="${x.id}">Delete</button></td></tr>`).join("")||"<tr><td colspan=7>No grades encoded.</td></tr>"}</table></div>`;
+  $("#view").innerHTML=`<div class="row"><button class="btn" id="add">Encode grade</button><button class="btn ghost" id="csv">Export Excel (CSV)</button><button class="btn ghost" id="pdf">Print / PDF</button></div><div class="card wrap"><table><tr><th>Student</th><th>Subject</th><th>Prelim</th><th>Midterm</th><th>Final</th><th>Avg</th><th></th></tr>${g.map(x=>`<tr><td>${esc(nm(x.studentId))}</td><td>${esc(x.subjectCode)}</td><td>${esc(x.prelim)}</td><td>${esc(x.midterm)}</td><td>${esc(x.final)}</td><td>${avg(x)}</td><td><button class="btn sm ghost" data-e="${x.id}">Edit</button> <button class="btn sm red" data-d="${x.id}">Delete</button></td></tr>`).join("")||"<tr><td colspan=7>No grades encoded.</td></tr>"}</table></div>`;
   const F=x=>[{k:"studentId",l:"Student",v:x?.studentId,o:stu.map(a=>[a.id,`${a.studentId} – ${fullName(a)}`])},{k:"subjectId",l:"Subject",v:x?.subjectId,o:s.map(a=>[a.id,`${a.code} – ${a.name}`])},...["prelim","midterm","final"].map(k=>({k,l:k[0].toUpperCase()+k.slice(1)+" (0–100)",t:"number",v:x?.[k]}))];
   const pack=d=>{const sj=s.find(a=>a.id===d.subjectId);return{studentId:d.studentId,subjectId:d.subjectId,subjectCode:sj.code,subjectName:sj.name,instructor:sj.instructor,prelim:+d.prelim,midterm:+d.midterm,final:+d.final}};
-  $("#add").onclick=()=>form("Encode grade",F(),d=>addDoc(collection(db,"grades"),pack(d)));
+  $("#csv").onclick=()=>csv("grades.csv",[["Student","Subject","Prelim","Midterm","Final","Average"],...g.map(x=>[nm(x.studentId),x.subjectCode,x.prelim,x.midterm,x.final,avg(x)])]);$("#pdf").onclick=()=>print();$("#add").onclick=()=>form("Encode grade",F(),d=>Promise.all([addDoc(collection(db,"grades"),pack(d)),notify(d.studentId,"A new grade was posted.")]));
   $("#view").querySelectorAll("[data-e]").forEach(b=>b.onclick=()=>{const x=g.find(y=>y.id===b.dataset.e);form("Edit grade",F(x),d=>updateDoc(doc(db,"grades",x.id),pack(d)))});
   $("#view").querySelectorAll("[data-d]").forEach(b=>b.onclick=async()=>{if(confirm("Delete this grade?")){await deleteDoc(doc(db,"grades",b.dataset.d));go("grades")}})};
 P.admin_announcements=async()=>{const a=await list("announcements","createdAt");$("#view").innerHTML=`<div class="row"><button class="btn" id="add">New announcement</button></div>`+annList(a,1);
   const F=x=>[{k:"title",l:"Title",v:x?.title},{k:"body",l:"Message",t:"area",v:x?.body}];
-  $("#add").onclick=()=>form("New announcement",F(),d=>addDoc(collection(db,"announcements"),{...d,author:fullName(me),createdAt:serverTimestamp()}));
+  $("#add").onclick=()=>form("New announcement",F(),d=>Promise.all([addDoc(collection(db,"announcements"),{...d,author:fullName(me),createdAt:serverTimestamp()}),notify("all","New announcement: "+d.title)]));
   $("#view").querySelectorAll("[data-e]").forEach(b=>b.onclick=()=>{const x=a.find(y=>y.id===b.dataset.e);form("Edit announcement",F(x),d=>updateDoc(doc(db,"announcements",x.id),d))});
   $("#view").querySelectorAll("[data-d]").forEach(b=>b.onclick=async()=>{if(confirm("Delete this announcement?")){await deleteDoc(doc(db,"announcements",b.dataset.d));go("announcements")}})};
+const notify=(userId,text)=>addDoc(collection(db,"notifications"),{userId,text,createdAt:serverTimestamp()});
+const mine=async c=>(await getDocs(query(collection(db,c),where("studentId","==",me.id)))).docs.map(d=>({id:d.id,...d.data()}));
+const tagc=s=>`<span class="tag ${["Absent","Late"].includes(s)?"bad":""}">${s}</span>`;
+const today=()=>new Date().toISOString().slice(0,10);
+const csv=(name,rows)=>{const t=rows.map(r=>r.map(v=>`"${String(v??"").replace(/"/g,'""')}"`).join(",")).join("\n");const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([t],{type:"text/csv"}));a.download=name;a.click()};
+const nmOf=(u,id)=>fullName(u.find(x=>x.id===id)||{});
+
+P.student_attendance=async()=>{
+  const a=(await mine("attendance")).sort((x,y)=>y.date.localeCompare(x.date)),c=s=>a.filter(x=>x.status===s).length;
+  const rate=a.length?Math.round((c("Present")+c("Late"))/a.length*100):0;
+  $("#view").innerHTML=`<div class="cards">${stat(c("Present"),"Present")}${stat(c("Absent"),"Absent")}${stat(c("Late"),"Late")}${stat(rate+"%","Attendance rate")}</div><div class="card wrap"><table><tr><th>Date</th><th>Subject</th><th>Status</th></tr>${a.map(x=>`<tr><td>${esc(x.date)}</td><td>${esc(x.subjectCode)}</td><td>${tagc(x.status)}</td></tr>`).join("")||"<tr><td colspan=3>No records yet.</td></tr>"}</table></div>`};
+
+P.student_assignments=async()=>{
+  const [as,sb]=await Promise.all([list("assignments","createdAt"),mine("submissions")]);
+  $("#view").innerHTML=as.map(x=>{const s=sb.find(y=>y.assignmentId===x.id),sts=s?(s.score!=null?"Graded":s.late?"Late":"Submitted"):"Pending";
+    return `<div class="card" style="margin-bottom:12px"><div class="row" style="justify-content:space-between;margin:0"><h3>${esc(x.title)}</h3><span class="tag ${sts==="Late"?"bad":""}">${sts}</span></div><small style="color:var(--mute)">${esc(x.subjectCode)} · Due ${esc(x.due)}</small><p>${esc(x.instructions)}</p>${s?.score!=null?`<p><b>Score: ${esc(s.score)}</b> ${esc(s.feedback||"")}</p>`:""}${s?`<a href="${esc(s.fileURL)}" target="_blank" rel="noopener">${esc(s.fileName)}</a>`:""}<div class="row" style="margin-top:10px"><input type="file" id="f${x.id}"><button class="btn sm" data-s="${x.id}">${s?"Resubmit":"Submit"}</button></div></div>`}).join("")||`<div class="card">No assignments yet.</div>`;
+  $("#view").querySelectorAll("[data-s]").forEach(b=>b.onclick=async()=>{const a=as.find(y=>y.id===b.dataset.s),f=$("#f"+a.id).files[0];
+    if(!f)return toast("Choose a file first");if(f.size>1e7)return toast("File must be under 10 MB");
+    try{const r=ref(st,`submissions/${me.id}/${a.id}-${f.name}`);await uploadBytes(r,f);
+      const data={fileURL:await getDownloadURL(r),fileName:f.name,late:today()>a.due,submittedAt:serverTimestamp()},id=`${a.id}_${me.id}`;
+      sb.find(y=>y.assignmentId===a.id)?await updateDoc(doc(db,"submissions",id),data):await setDoc(doc(db,"submissions",id),{...data,assignmentId:a.id,studentId:me.id});
+      toast("Submitted");go("assignments")}catch(e){toast("Upload failed: "+e.message)}})};
+
+P.student_notifications=async()=>{
+  const q=u=>getDocs(query(collection(db,"notifications"),where("userId","==",u))).then(s=>s.docs.map(d=>d.data()));
+  const n=[...await q("all"),...await q(me.id)].sort((a,b)=>(b.createdAt?.seconds||0)-(a.createdAt?.seconds||0));
+  $("#view").innerHTML=n.map(x=>`<div class="card" style="margin-bottom:10px">${esc(x.text)}<br><small style="color:var(--mute)">${x.createdAt?.toDate?.().toLocaleString()||""}</small></div>`).join("")||`<div class="card">You're all caught up.</div>`};
+
+P.admin_attendance=async()=>{
+  const [a,s,u]=await Promise.all([list("attendance"),list("subjects"),list("users")]);const stu=u.filter(x=>x.role==="student"&&x.status==="active");
+  const F=x=>[{k:"studentId",l:"Student",v:x?.studentId,o:stu.map(y=>[y.id,`${y.studentId} – ${fullName(y)}`])},{k:"subjectCode",l:"Subject",v:x?.subjectCode,o:s.map(y=>[y.code,`${y.code} – ${y.name}`])},{k:"date",l:"Date",t:"date",v:x?.date||today()},{k:"status",l:"Status",v:x?.status,o:["Present","Absent","Late"].map(y=>[y,y])}];
+  $("#view").innerHTML=`<div class="row"><button class="btn" id="add">Record attendance</button><input type="date" id="fd"><select id="fs"><option value="">All subjects</option>${s.map(x=>`<option>${esc(x.code)}</option>`).join("")}</select><button class="btn ghost" id="csv">Export CSV</button></div><div class="card wrap" id="tb"></div>`;
+  let r=a;const draw=()=>{const d=$("#fd").value,c=$("#fs").value;r=a.filter(x=>(!d||x.date===d)&&(!c||x.subjectCode===c));
+    $("#tb").innerHTML=`<table><tr><th>Date</th><th>Student</th><th>Subject</th><th>Status</th><th></th></tr>${r.map(x=>`<tr><td>${esc(x.date)}</td><td>${esc(nmOf(u,x.studentId))}</td><td>${esc(x.subjectCode)}</td><td>${tagc(x.status)}</td><td><button class="btn sm ghost" data-e="${x.id}">Edit</button> <button class="btn sm red" data-d="${x.id}">Delete</button></td></tr>`).join("")||"<tr><td colspan=5>No records.</td></tr>"}</table>`;
+    $("#tb").querySelectorAll("[data-d]").forEach(b=>b.onclick=async()=>{if(confirm("Delete record?")){await deleteDoc(doc(db,"attendance",b.dataset.d));go("attendance")}});
+    $("#tb").querySelectorAll("[data-e]").forEach(b=>b.onclick=()=>{const x=a.find(y=>y.id===b.dataset.e);form("Edit attendance",F(x),d=>updateDoc(doc(db,"attendance",x.id),d))})};
+  $("#add").onclick=()=>form("Record attendance",F(),d=>Promise.all([addDoc(collection(db,"attendance"),d),notify(d.studentId,`Attendance updated: ${d.status} in ${d.subjectCode}`)]));
+  $("#csv").onclick=()=>csv("attendance.csv",[["Date","Student","Subject","Status"],...r.map(x=>[x.date,nmOf(u,x.studentId),x.subjectCode,x.status])]);
+  $("#fd").onchange=draw;$("#fs").onchange=draw;draw()};
+
+P.admin_assignments=async()=>{
+  const [as,sb,s,u]=await Promise.all([list("assignments","createdAt"),list("submissions"),list("subjects"),list("users")]);const ti=id=>as.find(x=>x.id===id)?.title||"";
+  $("#view").innerHTML=`<div class="row"><button class="btn" id="add">Create assignment</button></div><div class="card wrap"><table><tr><th>Title</th><th>Subject</th><th>Due</th><th>Submissions</th><th></th></tr>${as.map(x=>`<tr><td>${esc(x.title)}</td><td>${esc(x.subjectCode)}</td><td>${esc(x.due)}</td><td>${sb.filter(y=>y.assignmentId===x.id).length}</td><td><button class="btn sm red" data-d="${x.id}">Delete</button></td></tr>`).join("")||"<tr><td colspan=5>None yet.</td></tr>"}</table></div>
+  <h3 style="margin:18px 0 10px">Submissions</h3><div class="card wrap"><table><tr><th>Student</th><th>Assignment</th><th>File</th><th>Timing</th><th>Score</th><th></th></tr>${sb.map(x=>`<tr><td>${esc(nmOf(u,x.studentId))}</td><td>${esc(ti(x.assignmentId))}</td><td><a href="${esc(x.fileURL)}" target="_blank" rel="noopener">${esc(x.fileName)}</a></td><td>${x.late?"Late":"On time"}</td><td>${esc(x.score??"–")}</td><td><button class="btn sm" data-g="${x.id}">Grade</button></td></tr>`).join("")||"<tr><td colspan=6>No submissions yet.</td></tr>"}</table></div>`;
+  $("#add").onclick=()=>form("Create assignment",[{k:"title",l:"Title"},{k:"subjectCode",l:"Subject",o:s.map(y=>[y.code,`${y.code} – ${y.name}`])},{k:"instructions",l:"Instructions",t:"area"},{k:"due",l:"Deadline",t:"date"}],d=>Promise.all([addDoc(collection(db,"assignments"),{...d,createdAt:serverTimestamp()}),notify("all",`New assignment: ${d.title} (due ${d.due})`)]));
+  $("#view").querySelectorAll("[data-d]").forEach(b=>b.onclick=async()=>{if(confirm("Delete this assignment?")){await deleteDoc(doc(db,"assignments",b.dataset.d));go("assignments")}});
+  $("#view").querySelectorAll("[data-g]").forEach(b=>b.onclick=()=>{const x=sb.find(y=>y.id===b.dataset.g);form("Grade submission",[{k:"score",l:"Score (0–100)",t:"number",v:x.score},{k:"feedback",l:"Feedback",t:"area",v:x.feedback}],d=>Promise.all([updateDoc(doc(db,"submissions",x.id),{score:+d.score,feedback:d.feedback}),notify(x.studentId,"Your assignment was graded: "+ti(x.assignmentId))]))})};
 </script>
 </body>
 </html>
