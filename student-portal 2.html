@@ -1,0 +1,311 @@
+<!--
+ALL-IN-ONE STUDENT PORTAL: this file is the whole app. Setup notes and security rules are below.
+
+# Northfield Student Portal
+
+Single-file app (`index.html`) + Firebase Auth, Firestore, Storage.
+
+## 1. Firebase setup
+1. Create a project at https://console.firebase.google.com
+2. Build > Authentication > Sign-in method > enable **Email/Password**
+3. Build > Firestore Database > Create (production mode)
+4. Build > Storage > Get started
+5. Project settings > Your apps > Web (</>) > copy the config into `firebaseConfig` in `index.html`
+6. Publish `firestore.rules` (Firestore > Rules) and `storage.rules` (Storage > Rules)
+
+## 2. Create the first admin (the only way to get an admin)
+1. Open the app and register a normal account, verify the email.
+2. In Firestore Console > `users` > your document: set `role` = `admin` and `status` = `active`.
+Rules block anyone from self-registering as admin.
+
+## 3. Run locally
+Modules need http, not file://:
+`python3 -m http.server 8000` then open http://localhost:8000
+Add `localhost` under Authentication > Settings > Authorized domains if prompted.
+
+## 4. Deploy
+`npm i -g firebase-tools && firebase login && firebase init hosting` (public dir = this folder) then `firebase deploy`.
+
+## Firestore structure
+- `users/{uid}`: role (student|admin), status (pending|active), studentId, firstName, middleName, lastName, birthday, gender, email, course, yearLevel, section, photoURL, createdAt
+- `subjects/{id}`: code, name, instructor, room, schedule, units
+- `grades/{id}`: studentId (uid), subjectId, subjectCode, subjectName, instructor, prelim, midterm, final
+- `announcements/{id}`: title, body, author, createdAt
+Storage: `profiles/{uid}/avatar`
+
+## Flow
+Student registers, verifies email, admin approves under Students > Approve, then the student can sign in.
+
+
+===== FIRESTORE RULES (paste in Firestore > Rules) =====
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{db}/documents {
+    function signedIn() { return request.auth != null; }
+    function isAdmin() {
+      return signedIn() &&
+        get(/databases/$(db)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    match /users/{uid} {
+      // Admins list everyone; students read only themselves
+      allow read: if isAdmin() || (signedIn() && request.auth.uid == uid);
+      // Self-registration: always a pending student, never an admin
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.role == 'student'
+        && request.resource.data.status == 'pending';
+      // Students may edit only these profile fields
+      allow update: if isAdmin() || (signedIn() && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys()
+           .hasOnly(['firstName','middleName','lastName','birthday','gender','photoURL']));
+      allow delete: if isAdmin();
+    }
+
+    match /grades/{id} {
+      allow read: if isAdmin() || (signedIn() && resource.data.studentId == request.auth.uid);
+      allow write: if isAdmin();
+    }
+    match /subjects/{id}      { allow read: if signedIn(); allow write: if isAdmin(); }
+    match /announcements/{id} { allow read: if signedIn(); allow write: if isAdmin(); }
+  }
+}
+
+===== STORAGE RULES (paste in Storage > Rules) =====
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /profiles/{uid}/{file} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && request.auth.uid == uid
+        && request.resource.size < 2 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+    }
+  }
+}
+
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Northfield Student Portal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:wght@600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+:root{--bg:#f4f6f3;--card:#fff;--ink:#14211c;--mute:#5d6b65;--line:#dfe5e0;--pri:#0f5c47;--pri2:#e8f2ee;--acc:#c8962b;--bad:#b3261e;--ok:#1b7a4b;--r:14px}
+[data-theme=dark]{--bg:#0e1512;--card:#16201b;--ink:#e8efeb;--mute:#93a49b;--line:#26332c;--pri:#4cc09a;--pri2:#1b2c25;--acc:#e0b04d;--bad:#ff8a80;--ok:#5fd493}
+*{box-sizing:border-box}body{margin:0;font:15px/1.5 Inter,system-ui,sans-serif;background:var(--bg);color:var(--ink)}
+h1,h2,h3{font-family:Fraunces,Georgia,serif;margin:0}
+button,input,select,textarea{font:inherit;color:inherit}
+input,select,textarea{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--card)}
+input:focus,select:focus,button:focus-visible{outline:2px solid var(--pri);outline-offset:1px}
+label{display:block;font-size:13px;color:var(--mute);margin:10px 0 4px}
+.btn{background:var(--pri);color:#fff;border:0;padding:10px 16px;border-radius:10px;cursor:pointer;font-weight:600;transition:transform .15s,opacity .15s}
+[data-theme=dark] .btn{color:#06120d}.btn:hover{opacity:.9}.btn:active{transform:scale(.97)}
+.btn.ghost{background:var(--pri2);color:var(--pri)}.btn.red{background:var(--bad);color:#fff}.btn.sm{padding:5px 10px;font-size:13px}
+.hide{display:none!important}
+#auth{min-height:100vh;display:grid;grid-template-columns:1fr 1fr}
+.hero{background:var(--pri);color:#fff;padding:48px;display:flex;flex-direction:column;justify-content:flex-end}
+.hero h1{font-size:clamp(32px,4vw,52px);line-height:1.1;max-width:12ch}.hero p{opacity:.85;max-width:34ch}
+.box{padding:32px;max-width:520px;width:100%;margin:auto}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}
+.pw{position:relative}.pw button{position:absolute;right:6px;top:4px;background:none;border:0;cursor:pointer;color:var(--mute)}
+#meter{height:4px;border-radius:4px;background:var(--line);margin-top:6px;overflow:hidden}#meter i{display:block;height:100%;width:0;transition:width .3s,background .3s}
+.link{color:var(--pri);cursor:pointer;font-weight:600;background:none;border:0;padding:0}
+#msg{margin:10px 0;font-size:14px;color:var(--bad)}#msg.ok{color:var(--ok)}
+#app{display:grid;grid-template-columns:240px 1fr;min-height:100vh}
+aside{background:var(--card);border-right:1px solid var(--line);padding:20px 14px;position:sticky;top:0;height:100vh;display:flex;flex-direction:column;gap:4px;z-index:5;transition:transform .25s}
+aside h2{font-size:20px;color:var(--pri);padding:4px 10px 16px}
+.nav{display:flex;gap:10px;align-items:center;padding:10px 12px;border-radius:10px;cursor:pointer;color:var(--mute);border:0;background:none;text-align:left;width:100%}
+.nav.on{background:var(--pri2);color:var(--pri);font-weight:600}.nav:hover{background:var(--pri2)}
+main{padding:24px;min-width:0}
+.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;gap:10px}
+#burger{display:none}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px;margin-bottom:18px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:18px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+.stat b{display:block;font:700 30px Fraunces,serif;color:var(--pri)}.stat span{color:var(--mute);font-size:13px}
+table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--line);font-size:14px}th{color:var(--mute);font-weight:500}
+.wrap{overflow-x:auto}
+.tag{padding:2px 10px;border-radius:99px;font-size:12px;font-weight:600;background:var(--pri2);color:var(--pri)}.tag.bad{background:#fbe4e2;color:var(--bad)}
+[data-theme=dark] .tag.bad{background:#3a1b19}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px}.row input,.row select{width:auto;flex:1;min-width:140px}
+#modal{position:fixed;inset:0;background:rgba(0,0,0,.45);display:grid;place-items:center;padding:16px;z-index:20}
+#modal form{background:var(--card);border-radius:var(--r);padding:22px;width:100%;max-width:440px;max-height:90vh;overflow:auto}
+.ava{width:84px;height:84px;border-radius:50%;object-fit:cover;background:var(--pri2)}
+#toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:10px 18px;border-radius:10px;z-index:30}
+@media(max-width:820px){#auth{grid-template-columns:1fr}.hero{display:none}
+#app{grid-template-columns:1fr}aside{position:fixed;left:0;width:240px;transform:translateX(-100%)}aside.open{transform:none}#burger{display:inline-block}.grid2{grid-template-columns:1fr}}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<section id="auth">
+  <div class="hero"><h1>Your term, in one place.</h1><p>Grades, subjects and school notices for Northfield students and staff.</p></div>
+  <div class="box">
+    <h2 id="authTitle">Sign in</h2>
+    <form id="authForm" novalidate></form>
+    <div id="msg" role="alert"></div>
+    <div id="authLinks"></div>
+  </div>
+</section>
+
+<section id="app" class="hide">
+  <aside id="side"><h2>Northfield</h2><div id="nav"></div><div style="flex:1"></div>
+    <button class="nav" id="themeBtn">Toggle dark mode</button><button class="nav" id="outBtn">Sign out</button></aside>
+  <main><div class="top"><button class="btn ghost" id="burger">Menu</button><h1 id="pageTitle"></h1><span id="who" style="color:var(--mute)"></span></div><div id="view"></div></main>
+</section>
+<div id="toast" class="hide"></div>
+
+<script type="module">
+/* ====== 1. PASTE YOUR FIREBASE CONFIG HERE ====== */
+const firebaseConfig = {
+  apiKey: "AIzaSyDOmn5va06m25SOau84LpRbrC4RGk0JO3U",
+  authDomain: "login-ada92.firebaseapp.com",
+  projectId: "login-ada92",
+  storageBucket: "login-ada92.firebasestorage.app",
+  messagingSenderId: "337306462259",
+  appId: "1:337306462259:web:18cb2d04138be7bd0cdb46"
+};
+/* ================================================= */
+import {initializeApp} from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import {getAuth,onAuthStateChanged,signInWithEmailAndPassword,createUserWithEmailAndPassword,sendEmailVerification,sendPasswordResetEmail,signOut,updatePassword} from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import {getFirestore,doc,getDoc,setDoc,updateDoc,deleteDoc,addDoc,collection,getDocs,query,orderBy,where,serverTimestamp} from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import {getStorage,ref,uploadBytes,getDownloadURL} from "https://www.gstatic.com/firebasejs/10.12.0/firebase-storage.js";
+
+const app=initializeApp(firebaseConfig),auth=getAuth(app),db=getFirestore(app),st=getStorage(app);
+const $=s=>document.querySelector(s);
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const list=async(c,o)=>(await getDocs(o?query(collection(db,c),orderBy(o,"desc")):collection(db,c))).docs.map(d=>({id:d.id,...d.data()}));
+const avg=g=>Math.round(((+g.prelim+ +g.midterm+ +g.final)/3)*10)/10;
+const fullName=u=>[u.firstName,u.middleName,u.lastName].filter(Boolean).join(" ");
+let me=null,page="",charts=[];
+function toast(t){const e=$("#toast");e.textContent=t;e.classList.remove("hide");setTimeout(()=>e.classList.add("hide"),2600)}
+function chart(id,type,labels,data,label){const c=new Chart($(id),{type,data:{labels,datasets:[{label,data,backgroundColor:["#0f5c47","#c8962b","#4cc09a","#6b8f71","#a3452f","#3b6ea5"],borderRadius:6}]},options:{plugins:{legend:{display:type!=="bar"}},scales:type==="bar"?{y:{beginAtZero:true}}:{}}});charts.push(c)}
+
+/* ---------- theme ---------- */
+const setTheme=t=>{document.documentElement.dataset.theme=t;localStorage.setItem("theme",t)};
+setTheme(localStorage.getItem("theme")||(matchMedia("(prefers-color-scheme:dark)").matches?"dark":"light"));
+$("#themeBtn").onclick=()=>setTheme(document.documentElement.dataset.theme==="dark"?"light":"dark");
+$("#burger").onclick=()=>$("#side").classList.toggle("open");
+
+/* ---------- auth UI ---------- */
+const say=(t,ok)=>{const m=$("#msg");m.textContent=t;m.className=ok?"ok":""};
+const fld=(id,l,t="text",x="")=>`<div><label for="${id}">${l}</label><input id="${id}" type="${t}" ${x}></div>`;
+const pwf=(id,l)=>`<div><label for="${id}">${l}</label><div class="pw"><input id="${id}" type="password" autocomplete="off"><button type="button" data-show="${id}">Show</button></div></div>`;
+function bindShow(){document.querySelectorAll("[data-show]").forEach(b=>b.onclick=()=>{const i=$("#"+b.dataset.show);i.type=i.type==="password"?"text":"password";b.textContent=i.type==="password"?"Show":"Hide"})}
+function authView(mode){
+  say("");const f=$("#authForm");$("#authTitle").textContent={login:"Sign in",reg:"Create student account",forgot:"Reset password"}[mode];
+  if(mode==="login")f.innerHTML=fld("email","Email","email")+pwf("pw","Password")+`<br><button class="btn" style="width:100%">Sign in</button>`;
+  if(mode==="forgot")f.innerHTML=fld("email","Email","email")+`<br><button class="btn" style="width:100%">Send reset link</button>`;
+  if(mode==="reg")f.innerHTML=`<div class="grid2">${fld("sid","Student ID")}${fld("email","Email","email")}${fld("fn","First name")}${fld("mn","Middle name")}${fld("ln","Last name")}${fld("bd","Birthday","date")}
+  <div><label>Gender</label><select id="gd"><option>Female</option><option>Male</option><option>Other</option></select></div>${fld("course","Course / Strand")}
+  <div><label>Year level</label><select id="yl"><option>1</option><option>2</option><option>3</option><option>4</option></select></div>${fld("sec","Section")}${pwf("pw","Password")}${pwf("pw2","Confirm password")}</div>
+  <div id="meter"><i></i></div><br><button class="btn" style="width:100%">Create account</button>`;
+  $("#authLinks").innerHTML=mode==="login"?`<p><button class="link" data-m="forgot">Forgot password?</button> · <button class="link" data-m="reg">Create account</button></p>`:`<p><button class="link" data-m="login">Back to sign in</button></p>`;
+  $("#authLinks").querySelectorAll("[data-m]").forEach(b=>b.onclick=()=>authView(b.dataset.m));
+  bindShow();
+  if(mode==="reg")$("#pw").oninput=e=>{const v=e.target.value;const s=[/.{8,}/,/[A-Z]/,/[0-9]/,/[^A-Za-z0-9]/].filter(r=>r.test(v)).length;const i=$("#meter i");i.style.width=s*25+"%";i.style.background=["#b3261e","#b3261e","#c8962b","#6b8f71","#1b7a4b"][s]};
+  f.onsubmit=async e=>{e.preventDefault();say("");try{await submitAuth(mode)}catch(err){say(err.code==="auth/email-already-in-use"?"That email already has an account.":err.code?.startsWith("auth/")?"Check your email and password and try again.":err.message)}}
+}
+async function submitAuth(mode){
+  const v=id=>$("#"+id)?.value.trim();
+  if(mode==="forgot"){await sendPasswordResetEmail(auth,v("email"));return say("Reset link sent. Check your inbox.",1)}
+  if(mode==="login"){const c=await signInWithEmailAndPassword(auth,v("email"),$("#pw").value);return}
+  const need=["sid","email","fn","ln","bd","course","sec"].find(k=>!v(k));if(need)return say("Fill in all required fields.");
+  if(!/^\S+@\S+\.\S+$/.test(v("email")))return say("Enter a valid email address.");
+  if($("#pw").value.length<8)return say("Password must be at least 8 characters.");
+  if($("#pw").value!==$("#pw2").value)return say("Passwords do not match.");
+  const c=await createUserWithEmailAndPassword(auth,v("email"),$("#pw").value);
+  await setDoc(doc(db,"users",c.user.uid),{role:"student",status:"pending",studentId:v("sid"),firstName:v("fn"),middleName:v("mn"),lastName:v("ln"),birthday:v("bd"),gender:$("#gd").value,email:v("email"),course:v("course"),yearLevel:$("#yl").value,section:v("sec"),photoURL:"",createdAt:serverTimestamp()});
+  await sendEmailVerification(c.user);await signOut(auth);authView("login");say("Account created. Verify your email, then wait for admin approval.",1);
+}
+
+onAuthStateChanged(auth,async u=>{
+  charts.forEach(c=>c.destroy());charts=[];
+  if(!u){me=null;$("#app").classList.add("hide");$("#auth").classList.remove("hide");return authView("login")}
+  const s=await getDoc(doc(db,"users",u.uid));
+  if(!s.exists()){await signOut(auth);return say("No profile found for this account.")}
+  me={id:u.uid,...s.data()};
+  if(me.role==="student"&&!u.emailVerified){await signOut(auth);return say("Verify your email first. Check your inbox.")}
+  if(me.role==="student"&&me.status!=="active"){await signOut(auth);return say("Your registration is awaiting admin approval.")}
+  $("#auth").classList.add("hide");$("#app").classList.remove("hide");$("#who").textContent=fullName(me)+" ("+me.role+")";
+  const items=me.role==="admin"?["dashboard","students","subjects","grades","announcements"]:["dashboard","grades","subjects","announcements","profile"];
+  $("#nav").innerHTML=items.map(i=>`<button class="nav" data-p="${i}">${i[0].toUpperCase()+i.slice(1)}</button>`).join("");
+  $("#nav").querySelectorAll(".nav").forEach(b=>b.onclick=()=>go(b.dataset.p));go("dashboard");
+});
+$("#outBtn").onclick=()=>signOut(auth);
+
+/* ---------- modal form ---------- */
+function form(title,fields,save){
+  const m=document.createElement("div");m.id="modal";
+  m.innerHTML=`<form><h3>${title}</h3>${fields.map(f=>`<label>${f.l}</label>`+(f.o?`<select name="${f.k}">${f.o.map(o=>`<option value="${esc(o[0])}" ${o[0]==f.v?"selected":""}>${esc(o[1])}</option>`).join("")}</select>`:f.t==="area"?`<textarea name="${f.k}" rows="4">${esc(f.v)}</textarea>`:`<input name="${f.k}" type="${f.t||"text"}" value="${esc(f.v)}">`)).join("")}
+  <div class="row" style="margin-top:16px"><button class="btn">Save</button><button type="button" class="btn ghost" id="cx">Cancel</button></div></form>`;
+  document.body.append(m);$("#cx").onclick=()=>m.remove();
+  m.querySelector("form").onsubmit=async e=>{e.preventDefault();const d=Object.fromEntries(new FormData(e.target));try{await save(d);m.remove();toast("Saved");go(page)}catch(x){toast("Could not save: "+x.message)}}
+}
+
+/* ---------- pages ---------- */
+const P={};const go=async p=>{page=p;charts.forEach(c=>c.destroy());charts=[];$("#side").classList.remove("open");
+  document.querySelectorAll(".nav[data-p]").forEach(b=>b.classList.toggle("on",b.dataset.p===p));
+  $("#pageTitle").textContent=p[0].toUpperCase()+p.slice(1);$("#view").innerHTML="Loading…";
+  try{await P[me.role+"_"+p]?.()||0}catch(e){$("#view").innerHTML=`<div class="card">Could not load: ${esc(e.message)}</div>`}};
+const stat=(n,l)=>`<div class="card stat"><b>${n}</b><span>${l}</span></div>`;
+const myGrades=async()=>(await getDocs(query(collection(db,"grades"),where("studentId","==",me.id)))).docs.map(d=>({id:d.id,...d.data()}));
+
+P.student_dashboard=async()=>{const g=await myGrades(),a=await list("announcements","createdAt");
+  const av=g.length?Math.round(g.reduce((s,x)=>s+avg(x),0)/g.length*10)/10:"–";
+  $("#view").innerHTML=`<div class="card" style="margin-bottom:14px"><h2>Welcome, ${esc(me.firstName)}</h2><p style="color:var(--mute);margin:4px 0 0">ID ${esc(me.studentId)} · ${esc(me.course)}, Year ${esc(me.yearLevel)} – ${esc(me.section)}</p></div>
+  <div class="cards">${stat(g.length,"Subjects graded")}${stat(av,"Average grade")}${stat(g.filter(x=>avg(x)<75).length,"Subjects failing")}${stat(a.length,"Announcements")}</div>
+  <div class="card"><canvas id="c1" height="110"></canvas></div>`;
+  chart("#c1","bar",g.map(x=>x.subjectCode),g.map(avg),"Overall average")};
+P.student_grades=async()=>{const g=await myGrades();
+  $("#view").innerHTML=`<div class="card wrap"><table><tr><th>Code</th><th>Subject</th><th>Instructor</th><th>Prelim</th><th>Midterm</th><th>Final</th><th>Average</th><th>Remarks</th></tr>${g.map(x=>`<tr><td>${esc(x.subjectCode)}</td><td>${esc(x.subjectName)}</td><td>${esc(x.instructor)}</td><td>${esc(x.prelim)}</td><td>${esc(x.midterm)}</td><td>${esc(x.final)}</td><td>${avg(x)}</td><td><span class="tag ${avg(x)<75?"bad":""}">${avg(x)<75?"Failed":"Passed"}</span></td></tr>`).join("")||`<tr><td colspan=8>No grades have been posted yet.</td></tr>`}</table></div>`};
+const subjTable=(s,admin)=>`<div class="card wrap"><table><tr><th>Code</th><th>Name</th><th>Instructor</th><th>Room</th><th>Schedule</th><th>Units</th>${admin?"<th></th>":""}</tr>${s.map(x=>`<tr><td>${esc(x.code)}</td><td>${esc(x.name)}</td><td>${esc(x.instructor)}</td><td>${esc(x.room)}</td><td>${esc(x.schedule)}</td><td>${esc(x.units)}</td>${admin?`<td><button class="btn sm ghost" data-e="${x.id}">Edit</button> <button class="btn sm red" data-d="${x.id}">Delete</button></td>`:""}</tr>`).join("")||`<tr><td colspan=7>No subjects yet.</td></tr>`}</table></div>`;
+P.student_subjects=async()=>{$("#view").innerHTML=subjTable(await list("subjects"))};
+const annList=(a,admin)=>a.map(x=>`<div class="card" style="margin-bottom:12px"><h3>${esc(x.title)}</h3><small style="color:var(--mute)">${x.createdAt?.toDate?.().toLocaleDateString()||""} · Posted by ${esc(x.author)}</small><p>${esc(x.body)}</p>${admin?`<button class="btn sm ghost" data-e="${x.id}">Edit</button> <button class="btn sm red" data-d="${x.id}">Delete</button>`:""}</div>`).join("")||`<div class="card">No announcements yet.</div>`;
+P.student_announcements=async()=>{$("#view").innerHTML=annList(await list("announcements","createdAt"))};
+P.student_profile=async()=>{const u=me;
+  $("#view").innerHTML=`<div class="card"><div class="row"><img class="ava" id="ava" alt="Profile" src="${esc(u.photoURL)}"><div><input type="file" id="pic" accept="image/*"><small style="color:var(--mute)">PNG or JPG, up to 2 MB</small></div></div>
+  <form id="pf" class="grid2">${fld("fn","First name","text",`value="${esc(u.firstName)}"`)}${fld("mn","Middle name","text",`value="${esc(u.middleName)}"`)}${fld("ln","Last name","text",`value="${esc(u.lastName)}"`)}${fld("bd","Birthday","date",`value="${esc(u.birthday)}"`)}
+  </form><p style="color:var(--mute)">Enrollment: ${esc(u.course)}, Year ${esc(u.yearLevel)}, Section ${esc(u.section)} · ${esc(u.email)}</p><button class="btn" id="sv">Save changes</button></div>
+  <div class="card" style="margin-top:14px"><h3>Change password</h3>${pwf("np","New password")}<button class="btn" id="cp" style="margin-top:12px">Update password</button></div>`;bindShow();
+  $("#sv").onclick=async()=>{await updateDoc(doc(db,"users",me.id),{firstName:$("#fn").value,middleName:$("#mn").value,lastName:$("#ln").value,birthday:$("#bd").value});Object.assign(me,{firstName:$("#fn").value,middleName:$("#mn").value,lastName:$("#ln").value,birthday:$("#bd").value});toast("Profile updated")};
+  $("#pic").onchange=async e=>{const f=e.target.files[0];if(!f)return;if(f.size>2e6)return toast("Image must be under 2 MB");const r=ref(st,`profiles/${me.id}/avatar`);await uploadBytes(r,f);const url=await getDownloadURL(r);await updateDoc(doc(db,"users",me.id),{photoURL:url});me.photoURL=url;$("#ava").src=url;toast("Photo updated")};
+  $("#cp").onclick=async()=>{try{await updatePassword(auth.currentUser,$("#np").value);toast("Password updated")}catch(e){toast(e.code==="auth/requires-recent-login"?"Sign in again, then retry.":"Use at least 6 characters.")}}};
+
+/* admin */
+P.admin_dashboard=async()=>{const [u,s,g]=await Promise.all([list("users"),list("subjects"),list("grades")]);const st_=u.filter(x=>x.role==="student");
+  const by={};st_.forEach(x=>by[x.course]=(by[x.course]||0)+1);const pass=g.filter(x=>avg(x)>=75).length;
+  $("#view").innerHTML=`<div class="cards">${stat(st_.length,"Students")}${stat(st_.filter(x=>x.status==="active").length,"Enrolled")}${stat(st_.filter(x=>x.status==="pending").length,"Pending registrations")}${stat(s.length,"Subjects")}</div>
+  <div class="cards" style="grid-template-columns:repeat(auto-fit,minmax(280px,1fr))"><div class="card"><h3>Students per course</h3><canvas id="c1"></canvas></div><div class="card"><h3>Passed vs failed grades</h3><canvas id="c2"></canvas></div></div>`;
+  chart("#c1","bar",Object.keys(by),Object.values(by),"Students");chart("#c2","doughnut",["Passed","Failed"],[pass,g.length-pass],"")};
+P.admin_students=async()=>{const all=(await list("users")).filter(x=>x.role==="student");
+  $("#view").innerHTML=`<div class="row"><input id="q" placeholder="Search name or ID"><select id="fs"><option value="">All statuses</option><option>pending</option><option>active</option></select></div><div class="card wrap" id="tb"></div>`;
+  const draw=()=>{const q=$("#q").value.toLowerCase(),f=$("#fs").value;const r=all.filter(x=>(!f||x.status===f)&&(fullName(x)+x.studentId).toLowerCase().includes(q));
+    $("#tb").innerHTML=`<table><tr><th>ID</th><th>Name</th><th>Course</th><th>Year/Sec</th><th>Status</th><th></th></tr>${r.map(x=>`<tr><td>${esc(x.studentId)}</td><td>${esc(fullName(x))}</td><td>${esc(x.course)}</td><td>${esc(x.yearLevel)}/${esc(x.section)}</td><td><span class="tag ${x.status==="pending"?"bad":""}">${x.status}</span></td><td>${x.status==="pending"?`<button class="btn sm" data-a="${x.id}">Approve</button> `:""}<button class="btn sm ghost" data-e="${x.id}">Edit</button> <button class="btn sm red" data-d="${x.id}">Delete</button></td></tr>`).join("")||"<tr><td colspan=6>No students match.</td></tr>"}</table>`;
+    $("#tb").querySelectorAll("[data-a]").forEach(b=>b.onclick=async()=>{await updateDoc(doc(db,"users",b.dataset.a),{status:"active"});toast("Approved");go("students")});
+    $("#tb").querySelectorAll("[data-d]").forEach(b=>b.onclick=async()=>{if(confirm("Delete this student record?")){await deleteDoc(doc(db,"users",b.dataset.d));go("students")}});
+    $("#tb").querySelectorAll("[data-e]").forEach(b=>b.onclick=()=>{const x=all.find(y=>y.id===b.dataset.e);form("Edit student",[["firstName","First name"],["middleName","Middle name"],["lastName","Last name"],["studentId","Student ID"],["course","Course / Strand"],["yearLevel","Year level"],["section","Section"]].map(([k,l])=>({k,l,v:x[k]})),d=>updateDoc(doc(db,"users",x.id),d))})};
+  $("#q").oninput=draw;$("#fs").onchange=draw;draw()};
+P.admin_subjects=async()=>{const s=await list("subjects");$("#view").innerHTML=`<div class="row"><button class="btn" id="add">Add subject</button></div>`+subjTable(s,1);
+  const F=x=>[["code","Code"],["name","Name"],["instructor","Instructor"],["room","Room"],["schedule","Schedule (e.g. Mon 9:00–10:30)"],["units","Units","number"]].map(([k,l,t])=>({k,l,t,v:x?.[k]}));
+  $("#add").onclick=()=>form("Add subject",F(),d=>addDoc(collection(db,"subjects"),d));
+  $("#view").querySelectorAll("[data-e]").forEach(b=>b.onclick=()=>{const x=s.find(y=>y.id===b.dataset.e);form("Edit subject",F(x),d=>updateDoc(doc(db,"subjects",x.id),d))});
+  $("#view").querySelectorAll("[data-d]").forEach(b=>b.onclick=async()=>{if(confirm("Delete this subject?")){await deleteDoc(doc(db,"subjects",b.dataset.d));go("subjects")}})};
+P.admin_grades=async()=>{const [g,s,u]=await Promise.all([list("grades"),list("subjects"),list("users")]);const stu=u.filter(x=>x.role==="student"&&x.status==="active"),nm=id=>fullName(u.find(x=>x.id===id)||{});
+  $("#view").innerHTML=`<div class="row"><button class="btn" id="add">Encode grade</button></div><div class="card wrap"><table><tr><th>Student</th><th>Subject</th><th>Prelim</th><th>Midterm</th><th>Final</th><th>Avg</th><th></th></tr>${g.map(x=>`<tr><td>${esc(nm(x.studentId))}</td><td>${esc(x.subjectCode)}</td><td>${esc(x.prelim)}</td><td>${esc(x.midterm)}</td><td>${esc(x.final)}</td><td>${avg(x)}</td><td><button class="btn sm ghost" data-e="${x.id}">Edit</button> <button class="btn sm red" data-d="${x.id}">Delete</button></td></tr>`).join("")||"<tr><td colspan=7>No grades encoded.</td></tr>"}</table></div>`;
+  const F=x=>[{k:"studentId",l:"Student",v:x?.studentId,o:stu.map(a=>[a.id,`${a.studentId} – ${fullName(a)}`])},{k:"subjectId",l:"Subject",v:x?.subjectId,o:s.map(a=>[a.id,`${a.code} – ${a.name}`])},...["prelim","midterm","final"].map(k=>({k,l:k[0].toUpperCase()+k.slice(1)+" (0–100)",t:"number",v:x?.[k]}))];
+  const pack=d=>{const sj=s.find(a=>a.id===d.subjectId);return{studentId:d.studentId,subjectId:d.subjectId,subjectCode:sj.code,subjectName:sj.name,instructor:sj.instructor,prelim:+d.prelim,midterm:+d.midterm,final:+d.final}};
+  $("#add").onclick=()=>form("Encode grade",F(),d=>addDoc(collection(db,"grades"),pack(d)));
+  $("#view").querySelectorAll("[data-e]").forEach(b=>b.onclick=()=>{const x=g.find(y=>y.id===b.dataset.e);form("Edit grade",F(x),d=>updateDoc(doc(db,"grades",x.id),pack(d)))});
+  $("#view").querySelectorAll("[data-d]").forEach(b=>b.onclick=async()=>{if(confirm("Delete this grade?")){await deleteDoc(doc(db,"grades",b.dataset.d));go("grades")}})};
+P.admin_announcements=async()=>{const a=await list("announcements","createdAt");$("#view").innerHTML=`<div class="row"><button class="btn" id="add">New announcement</button></div>`+annList(a,1);
+  const F=x=>[{k:"title",l:"Title",v:x?.title},{k:"body",l:"Message",t:"area",v:x?.body}];
+  $("#add").onclick=()=>form("New announcement",F(),d=>addDoc(collection(db,"announcements"),{...d,author:fullName(me),createdAt:serverTimestamp()}));
+  $("#view").querySelectorAll("[data-e]").forEach(b=>b.onclick=()=>{const x=a.find(y=>y.id===b.dataset.e);form("Edit announcement",F(x),d=>updateDoc(doc(db,"announcements",x.id),d))});
+  $("#view").querySelectorAll("[data-d]").forEach(b=>b.onclick=async()=>{if(confirm("Delete this announcement?")){await deleteDoc(doc(db,"announcements",b.dataset.d));go("announcements")}})};
+</script>
+</body>
+</html>
